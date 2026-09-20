@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# Environment variables (your Gemini API key lives here — never commit this)
+.env
+
+# Editor
+.vscode/
