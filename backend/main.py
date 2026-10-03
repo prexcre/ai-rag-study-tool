@@ -32,6 +32,20 @@ class Question(BaseModel):
     options: Optional[list[str]] = None #only used for multiple choice 
     correct_answer: str
 
+class EvaluateAnswer(BaseModel):
+    question: Question
+    student_answer: str
+
+class EvaluateAnswersRequest(BaseModel):
+    answers: list[EvaluateAnswer]
+
+class AnswerResult(BaseModel):
+    question: Question
+    is_correct: bool
+    feedback: Optional[str] = None
+
+    
+
 #Why Optional[list[str]] = None for options.
 #  A short-answer question doesn't have multiple-choice options, but a multiple-choice question does. 
 # Rather than lying and putting empty options on every question, we mark the field as optional — 
@@ -57,6 +71,14 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
     questions_data = json.loads(response.text)
     questions = [Question(**q) for q in questions_data]
     return questions
+
+
+@app.post("/evaluate-answers")
+async def evaluate_answers(request: EvaluateAnswersRequest):
+    pass
+
+
+
 
 
 
