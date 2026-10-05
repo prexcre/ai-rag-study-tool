@@ -44,6 +44,10 @@ class AnswerResult(BaseModel):
     is_correct: bool
     feedback: Optional[str] = None
 
+class GradeResult(BaseModel):
+    is_correct: bool
+    feedback: str
+
     
 
 #Why Optional[list[str]] = None for options.
@@ -74,8 +78,27 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
 
 
 @app.post("/evaluate-answers")
-async def evaluate_answers(request: EvaluateAnswersRequest):
-    pass
+async def evaluate_answers(request: EvaluateAnswersRequest) -> list[AnswerResult]:
+    results = []
+    for answer in request.answers:
+        if answer.question.question_type == "multiple_choice":
+            is_correct = answer.student_answer == answer.question.correct_answer
+            result = AnswerResult(question=answer.question, is_correct=is_correct, feedback="N/A")
+            results.append(result)
+        else:
+            response = client.models.generate_content(
+                model="gemini-3.5-flash-lite",
+                contents=f"Question: {answer.question.question_text}\nCorrect answer: {answer.question.correct_answer}\nStudent's answer: {answer.student_answer}\n\nDetermine if the student's answer is correct, and give brief feedback explaining why.",
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": GradeResult,
+                }
+            )
+            grade_data = json.loads(response.text)
+            grade = GradeResult(**grade_data)
+            result = AnswerResult(question=answer.question, is_correct=grade.is_correct, feedback=grade.feedback)
+            results.append(result)
+    return results
 
 
 
