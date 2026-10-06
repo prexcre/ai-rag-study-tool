@@ -5,11 +5,22 @@ from typing import Literal
 from google import genai
 from dotenv import load_dotenv
 import json
+from fastapi.middleware.cors import CORSMiddleware
+
 
 
 load_dotenv()
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # dev only — lock this to a real domain before shipping
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 client = genai.Client()
 
 #BaseModel is the whole trick. Any class that inherits from Pydantic's BaseModel 
