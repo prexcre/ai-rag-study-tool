@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StudyHelper</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --primary: #6366F1;
+    --bg: #0F172A;
+    --surface: #1E293B;
+    --text: #F8FAFC;
+    --muted: #94A3B8;
+    --correct: #22C55E;
+    --incorrect: #EF4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    padding: 32px 16px 80px;
+  }
+  .container { max-width: 720px; margin: 0 auto; }
+  h1 { font-weight: 700; font-size: 28px; margin-bottom: 4px; }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 24px; }
+  .card {
+    background: var(--surface);
+    border-radius: 12px;
+    padding: 24px;
+    margin-bottom: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  }
+  label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
+  textarea, input[type=number], input[type=text] {
+    width: 100%;
+    background: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    color: var(--text);
+    padding: 10px 12px;
+    font-family: inherit;
+    font-size: 14px;
+    margin-bottom: 16px;
+  }
+  textarea { min-height: 140px; resize: vertical; }
+  button {
+    background: var(--primary);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .question-block { margin-bottom: 20px; }
+  .question-text { font-weight: 600; margin-bottom: 10px; }
+  .option-label {
+    display: block;
+    background: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .option-label:hover { border-color: var(--primary); }
+  .result-card { border-left: 4px solid var(--muted); }
+  .result-card.correct { border-left-color: var(--correct); }
+  .result-card.incorrect { border-left-color: var(--incorrect); }
+  .result-tag { font-size: 12px; font-weight: 700; text-transform: uppercase; }
+  .result-tag.correct { color: var(--correct); }
+  .result-tag.incorrect { color: var(--incorrect); }
+  .feedback { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .score-banner { font-size: 20px; font-weight: 700; text-align: center; margin-bottom: 20px; }
+  .hidden { display: none; }
+  .loading { color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>StudyHelper</h1>
+  <div class="subtitle">Paste your course material, generate questions, test yourself.</div>
+
+  <!-- Screen 1: Input -->
+  <div id="input-screen" class="card">
+    <label for="course-text">Course material</label>
+    <textarea id="course-text" placeholder="Paste your notes, textbook excerpt, or study guide here..."></textarea>
+    <label for="num-questions">Number of questions</label>
+    <input type="number" id="num-questions" value="3" min="1" max="10">
+    <button id="generate-btn" onclick="generateQuestions()">Generate Questions</button>
+    <div id="generate-loading" class="loading hidden">Generating questions...</div>
+  </div>
+
+  <!-- Screen 2: Questions -->
+  <div id="questions-screen" class="hidden"></div>
+
+  <!-- Screen 3: Results -->
+  <div id="results-screen" class="hidden"></div>
+</div>
+
+<script>
+  const API_BASE = "http://127.0.0.1:8000";
+  // Each question here is {id, question_text, question_type, options} — no correct_answer.
+  let currentQuestions = [];
+
+  async function generateQuestions() {
+    const courseText = document.getElementById("course-text").value.trim();
+    const numQuestions = parseInt(document.getElementById("num-questions").value);
+
+    if (!courseText) {
+      alert("Please paste some course material first.");
+      return;
+    }
+
+    document.getElementById("generate-btn").disabled = true;
+    document.getElementById("generate-loading").classList.remove("hidden");
+
+    try {
+      const res = await fetch(`${API_BASE}/generate-questions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ course_text: courseText, num_questions: numQuestions })
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      currentQuestions = await res.json();
+      renderQuestions();
+    } catch (err) {
+      alert("Failed to generate questions: " + err.message + "\n\nIs your backend running on " + API_BASE + "?");
+    } finally {
+      document.getElementById("generate-btn").disabled = false;
+      document.getElementById("generate-loading").classList.add("hidden");
+    }
+  }
+
+  function renderQuestions() {
+    document.getElementById("input-screen").classList.add("hidden");
+    document.getElementById("results-screen").classList.add("hidden");
+
+    const container = document.getElementById("questions-screen");
+    container.innerHTML = "";
+    container.classList.remove("hidden");
+
+    currentQuestions.forEach((q, i) => {
+      const block = document.createElement("div");
+      block.className = "card question-block";
+
+      let inputHtml = "";
+      if (q.question_type === "multiple_choice") {
+        inputHtml = q.options.map((opt) => `
+          <label class="option-label">
+            <input type="radio" name="q${i}" value="${escapeHtml(opt)}"> ${escapeHtml(opt)}
+          </label>
+        `).join("");
+      } else {
+        inputHtml = `<input type="text" id="answer-${i}" placeholder="Type your answer...">`;
+      }
+
+      block.innerHTML = `
+        <div class="question-text">${i + 1}. ${escapeHtml(q.question_text)}</div>
+        ${inputHtml}
+      `;
+      container.appendChild(block);
+    });
+
+    const submitBtn = document.createElement("button");
+    submitBtn.textContent = "Submit Answers";
+    submitBtn.onclick = submitAnswers;
+    container.appendChild(submitBtn);
+  }
+
+  async function submitAnswers() {
+    // Send only the ticket (question_id) and what the student typed.
+    const answers = currentQuestions.map((q, i) => {
+      let studentAnswer = "";
+      if (q.question_type === "multiple_choice") {
+        const selected = document.querySelector(`input[name="q${i}"]:checked`);
+        studentAnswer = selected ? selected.value : "";
+      } else {
+        studentAnswer = document.getElementById(`answer-${i}`).value;
+      }
+      return { question_id: q.id, student_answer: studentAnswer };
+    });
+
+    try {
+      const res = await fetch(`${API_BASE}/evaluate-answers`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ answers })
+      });
+      if (!res.ok) throw new Error(`Server returned ${res.status}`);
+      const results = await res.json();
+      renderResults(results);
+    } catch (err) {
+      alert("Failed to evaluate answers: " + err.message);
+    }
+  }
+
+  function renderResults(results) {
+    document.getElementById("questions-screen").classList.add("hidden");
+
+    const container = document.getElementById("results-screen");
+    container.innerHTML = "";
+    container.classList.remove("hidden");
+
+    const correctCount = results.filter(r => r.is_correct).length;
+    const banner = document.createElement("div");
+    banner.className = "score-banner";
+    banner.textContent = `${correctCount} / ${results.length} correct`;
+    container.appendChild(banner);
+
+    results.forEach((r, i) => {
+      // Results come back in the same order as the questions we sent.
+      const questionText = currentQuestions[i].question_text;
+      const card = document.createElement("div");
+      card.className = `card result-card ${r.is_correct ? "correct" : "incorrect"}`;
+      card.innerHTML = `
+        <div class="result-tag ${r.is_correct ? "correct" : "incorrect"}">${r.is_correct ? "Correct" : "Incorrect"}</div>
+        <div class="question-text">${i + 1}. ${escapeHtml(questionText)}</div>
+        <div style="color: var(--muted); font-size: 13px;">Correct answer: ${escapeHtml(r.correct_answer)}</div>
+        ${r.feedback ? `<div class="feedback">${escapeHtml(r.feedback)}</div>` : ""}
+      `;
+      container.appendChild(card);
+    });
+
+    const restartBtn = document.createElement("button");
+    restartBtn.textContent = "Start New Session";
+    restartBtn.style.marginTop = "12px";
+    restartBtn.onclick = () => {
+      document.getElementById("results-screen").classList.add("hidden");
+      document.getElementById("input-screen").classList.remove("hidden");
+      document.getElementById("course-text").value = "";
+    };
+    container.appendChild(restartBtn);
+  }
+
+  function escapeHtml(str) {
+    const div = document.createElement("div");
+    div.textContent = str;
+    return div.innerHTML;
+  }
+</script>
+</body>
+</html>
