@@ -66,20 +66,15 @@ A running technical log of concepts covered while building this project. Each en
 
 ### 8. Evaluation design: deterministic vs. LLM-graded branches
 
-**Pattern used:** `/evaluate-answers` branches on `question_type`. Multiple choice is graded with plain Python string comparison — fast, free, perfectly reliable, no ambiguity to resolve. Short answer is graded via a second Gemini call, using the same schema-constrained-output pattern as question generation, but with a smaller purpose-built schema (`GradeResult: {is_correct, feedback}`) distinct from the question-generation schema.
+**Pattern used:** the evaluate route branches on `question_type`. Multiple choice is graded with plain Python string comparison — fast, free, perfectly reliable, no ambiguity to resolve. Short answer is graded via a second Gemini call, using the same schema-constrained-output pattern as question generation, but with a smaller purpose-built schema (`GradeResult: {is_correct, feedback}`) distinct from the question-generation schema.
 
-**Why two separate Pydantic classes (`GradeResult` vs `AnswerResult`) instead of one:** `GradeResult` is only what the LLM needs to produce (its judgment). `AnswerResult` is the richer object the route actually returns to the client — it also carries the full nested `Question` (for context/display) which the LLM doesn't need to generate since the caller already has it. Keeping "what the LLM outputs" separate from "what the API returns" avoids conflating two different concerns into one schema.
+**Why `GradeResult` is separate from what the API returns:** `GradeResult` is only what the LLM needs to produce (its judgment). What the route returns to the client is a different thing with different fields. Keeping "what the LLM outputs" separate from "what the API returns" avoids conflating two different concerns into one schema.
 
-**Known gap found during testing (carried into Phase 2):** `correct_answer` currently has to travel through the client between generate and evaluate steps, since nothing is persisted server-side yet — a real trust-boundary issue, not a logic bug.
+**Known gap found during testing (fixed in Phase 2):** `correct_answer` had to travel through the client between generate and evaluate steps, since nothing was persisted server-side — a real trust-boundary issue, not a logic bug.
 
 ### Phase 1 end-to-end test result
 
 Full click-through (generate → answer → submit → results) worked cleanly, including both the deterministic and LLM-graded branches.
-
-### Small smells noted at the end of Phase 1 (not yet fixed)
-
-- `feedback="N/A"` for multiple choice is a **sentinel string**, and the frontend special-cases it (`r.feedback !== "N/A"`). The model already declares `feedback: Optional[str] = None`, so `None` is the honest value for "no feedback." Fix when `main.py` is reworked for persistence.
-- Routes are `async def` but `client.models.generate_content(...)` is a **blocking** call, which stalls the event loop while waiting on Gemini. Harmless for one local user; revisit if concurrency ever matters.
 
 ---
 
@@ -137,7 +132,7 @@ courses → materials → questions → attempts
 
 **Design choices worth remembering:**
 - **Attempts are append-only.** Each answer is a new row with a timestamp, never an overwrite, because "discover lapses in knowledge" needs history over time.
-- **`feedback` is nullable** (no `NOT NULL`) so multiple choice can honestly store "nothing" instead of an `"N/A"` sentinel.
+- **`feedback` is nullable** (no `NOT NULL`) so multiple choice can honestly store "nothing" instead of an `"N/A"` sentinel. The `"N/A"` hack is now gone from both backend and frontend.
 - **`options` is nullable** because short-answer questions have none.
 - **SQLite has no boolean type**, so `is_correct` is `INTEGER` (1 / 0).
 - **"Don't repeat questions" needs no extra table.** It falls out of having `questions` and `attempts` separate: "questions not yet attempted" is just a query.
@@ -145,7 +140,7 @@ courses → materials → questions → attempts
 
 ### 6. The trust-boundary fix (coat-check model)
 
-**The real problem was worse than "inspectable."** Phase 1's `/evaluate-answers` accepts the whole `Question` from the client, including `correct_answer`. A student could not only *read* the answer but *write* it: send a question whose `correct_answer` equals their own wrong answer and the server marks it correct. The server never verified that the question it was grading was one it actually generated.
+**The real problem was worse than "inspectable."** Phase 1's evaluate route accepted the whole `Question` from the client, including `correct_answer`. A student could not only *read* the answer but *write* it: send a question whose `correct_answer` equals their own wrong answer and the server marks it correct. The server never verified that the question it was grading was one it actually generated.
 
 **Coat-check analogy:** the coat is `correct_answer` and stays in the back room (the database). The ticket is the `question_id`, which is all the browser holds. The server looks things up itself.
 
@@ -167,7 +162,7 @@ courses → materials → questions → attempts
 - **Guard for `None`:** `json.dumps(None)` yields the text `"null"`, not a true empty cell. So:
 
 ```python
-options_text = json.dumps(question.options) if question.options is not None else None
+options_text = json.dumps(q.options) if q.options is not None else None
 ```
 
 ### 8. Using SQLite from Python (`database.py`)
@@ -182,16 +177,98 @@ conn.commit()                        # nothing is permanent until you commit
 
 - **`IF NOT EXISTS`** makes the file safe to run repeatedly.
 - **`commit()`** is the "save" button; changes are pending until it runs.
-- **Placeholders for inserts:** `INSERT ... VALUES (?, ?, ?)` with a tuple of values, never pasting values into the SQL string, so odd text (like quotes in a question) can't break or hijack the command.
+- **`main.py` does `from database import conn`.** Importing runs `database.py` once, which makes sure the tables exist and shares the same connection.
+- **File location gotcha:** `connect("study.db")` is a relative path, so the file is created in whatever folder the server is started from. Start Uvicorn from `backend/` every time (or switch to an absolute path later) so there's only ever one `study.db`.
 - **Mac gotcha:** the command is `python3`, not `python`, unless a virtual environment is active.
-- **Verifying:** `study.db` contains the original `CREATE TABLE` text for each table, which confirmed all four tables exist.
 
-### Status at end of this session
+### 9. Two models per audience: `Question` vs. `QuestionOut`
 
-- ✅ Schema designed and understood
-- ✅ `database.py` creates all four tables in `study.db`
-- ⏭️ Next: make `main.py` save generated questions into these tables, return `question_id`s (no `correct_answer`) to the browser, and change `/evaluate-answers` to take `question_id` + `student_answer` and look up ground truth itself
-- ⏭️ Frontend will need a matching small update (Claude builds it)
+**Problem:** the same question needs two shapes. Inside the server it includes `correct_answer`. Going to the browser it must not.
+
+**Fix:** `Question` is the full shape (what Gemini generates and what we save). `QuestionOut` is the browser-safe shape: `id`, `question_text`, `question_type`, `options`, and no `correct_answer`.
+
+**Why it's strong:** the safety is built into the *shape*. If a route returns `QuestionOut`, `correct_answer` can't leak, because the model has no field to carry it. Same idea as keeping `GradeResult` (what the LLM outputs) separate from what the API returns.
+
+The browser-to-server direction mirrors it: `SubmittedAnswer` has only `question_id: int` and `student_answer: str`, with no question object inside.
+
+### 10. Saving and the ticket: `INSERT`, placeholders, `lastrowid`
+
+```python
+cursor = conn.execute(
+    "INSERT INTO courses (name, created_at) VALUES (?, ?)",
+    ("Untitled course", datetime.now().isoformat())
+)
+course_id = cursor.lastrowid
+```
+
+- `INSERT INTO table (columns) VALUES (...)`: first half names the columns, second half holds the values, in the same order.
+- **`?` placeholders** hold open one blank per value; the tuple fills them left to right. Never paste values into the SQL text: an apostrophe in a question would break the command, and someone could smuggle in SQL of their own (SQL injection). With placeholders, whatever fills a blank is treated purely as data.
+- **Debug rule:** when an insert fails, count the columns, the `?` marks, and the tuple values. All three must be equal.
+- **`cursor.lastrowid`** is the `id` the database just assigned to the new row. The chain is: save the course (get `course_id`), save the material with it (get `material_id`), save each question with it (get `question_id`, the ticket the browser holds).
+- `datetime.now().isoformat()` is the timestamp text for every `created_at` / `attempted_at`.
+- **The placeholder course:** `materials.course_id` is `NOT NULL`, and there's no course screen yet, so each generation creates an `"Untitled course"`. Real course management comes later.
+
+### 11. Reading a row back: `SELECT`, `WHERE`, `fetchone`, and the 404 guard
+
+```python
+row = conn.execute(
+    "SELECT question_text, question_type, correct_answer FROM questions WHERE id = ?",
+    (submitted.question_id,)
+).fetchone()
+if row is None:
+    raise HTTPException(status_code=404, detail=f"Question {submitted.question_id} not found")
+question_text, question_type, correct_answer = row
+```
+
+- `fetchone()` returns one row as a tuple in the order of the `SELECT` columns, or `None` if nothing matched.
+- A one-item tuple needs the trailing comma: `(submitted.question_id,)`.
+- Inside `questions`, the browser's `question_id` is compared against the table's own `id` (primary key). The name `question_id` only exists in the request and in `attempts`.
+- **Why a 404 and not a crash or a silent skip:** a bad id is the *client's* mistake. HTTP status codes encode that: **4xx = client error, 5xx = server error.** A crash would report a server bug (500) for something the server did correctly. Silently skipping would quietly corrupt the student's score.
+- Tuple unpacking (`a, b, c = row`) gives named variables instead of `row[0]`, `row[1]`.
+
+### 12. Append-only attempts and where `commit()` goes
+
+Every graded answer inserts a **new** `attempts` row. Nothing is ever updated or overwritten. Submitting the same question twice creates two rows, which is exactly the history that Phase 5 needs.
+
+`conn.commit()` goes **after** the loop, at the same indentation as `return`, so all attempts from one submission are saved together. Without it the inserts stay pending and vanish.
+
+**What attempts can tell you that a score can't:**
+- **Number of attempts** (per *concept*, once concepts exist) shows struggle. A repeat attempt right after seeing the answer is weaker evidence than a cold one.
+- **Quality of the attempt** shows understanding. For multiple choice, `student_answer` records *which* wrong option was picked, which can point to a specific misconception. For short answer, `feedback` records why it was off.
+- **Timestamps** show improvement over time and forgetting after a gap, the basis of spaced repetition.
+
+### 13. Revealing the correct answer after grading
+
+The server now returns `correct_answer` in the evaluate response, so the results screen can show it. That doesn't undo the trust-boundary fix: the coat stays in the back room until the student has committed an answer.
+
+**Known caveat:** a student could resubmit the same question after seeing the answer. Harmless for a study tool, but Phase 5 mastery tracking should weigh a repeat attempt differently from a first try.
+
+### 14. Refactoring pattern: build alongside, then replace
+
+Instead of rewriting `/evaluate-answers` in place, we added `EvaluateAnswersRequest2` and `/evaluate-answers-v2`, tested it with real ids and fake ones, and only then deleted the old classes and route and renamed the new ones. The old behavior stayed available as a reference until the new one was proven. Temporary names (`2`, `-v2`) are a signal to clean up.
+
+### 15. Bugs and gotchas hit this phase
+
+- **Indentation = scope.** Pasting the insert code with only its first line indented under the `def` made later lines fall out of the function. They ran at module level where `request` and `course_id` don't exist, producing "X is not defined." When you see that error, ask whether the code using X is still inside the function that creates it.
+- **`cursor` isn't imported.** It's a variable created by `conn.execute(...)`; only `conn` is imported.
+- **Test with real data, and say when you haven't.** An empty `SELECT` result meant no questions had been generated yet since the saving code was added, not a broken database. Don't trust a test you didn't run.
+- **`EvaluateAnswersRequest` vs. `GradeResult`:** the schema passed to Gemini must be the same class used to parse its reply (`GradeResult`).
+
+### 16. Git hygiene
+
+- **Never commit the database.** `study.db` is data, not code. `database.py` rebuilds it. It's in `.gitignore`.
+- **`.gitignore` newline gotcha:** `echo "study.db" >> .gitignore` glued onto the last line (`.vscode/study.db`) because the file didn't end in a newline. Always check the file after appending.
+- **Stage deliberately.** `git add .` is safe once ignores are right, but it only covers the current folder and below, so run it from the repo root and read `git status` before committing.
+- **Verify assumptions with `ls`.** A file assumed to be a stray duplicate (`frontend_index.html`) turned out to be the real, never-committed frontend; `frontend/` was empty. It now lives at `frontend/index.html`.
+
+### Status at end of Phase 2
+
+- ✅ Schema designed, built (`database.py`), and understood
+- ✅ `/generate-questions` saves course, material, and questions; returns `QuestionOut` (ids, no answers)
+- ✅ `/evaluate-answers` takes `question_id` + `student_answer`, looks up ground truth server-side, grades (deterministic or Gemini), saves an attempt, and returns the correct answer
+- ✅ Frontend updated and tested end to end with real notes (science and math)
+- ⏭️ Deferred: `concepts` and `question_concepts` tables (Phase 5), real course management, session scoping on question ids, absolute path for `study.db`
+- ⏭️ Known smell: routes are `async def` but the Gemini and SQLite calls are blocking; fine for one local user
 
 ---
 
