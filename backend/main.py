@@ -8,6 +8,9 @@ import json
 from fastapi.middleware.cors import CORSMiddleware
 from database import conn
 from datetime import datetime
+from chunking import chunk_text
+from embeddings import embed_text
+from search import search_chunks, spread_chunks
 
 
 load_dotenv()
@@ -39,6 +42,7 @@ client = genai.Client()
 class GenerateQuestionsRequest(BaseModel):
     course_text: str
     num_questions: int
+    topic: Optional[str] = None
 
 
 # The FULL question, including the answer key. Used inside the server only:
@@ -95,11 +99,48 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
         (course_id, None, request.course_text, datetime.now().isoformat())
     )
     material_id = cursor.lastrowid
+    # 1b. Cut the material into chunks, embed each one, and save it.
+    # Embedding happens now, once, because a chunk's text never changes,
+    # so its meaning fingerprint never changes either. Doing it at save
+    # time means searching later is cheap: the numbers are already stored.
+    chunks = chunk_text(request.course_text)
+    for index, chunk in enumerate(chunks):
+        # Ask the embedding model for this chunk's 3,072 numbers.
+        embedding = embed_text(chunk)
+
+        # A list can't sit in one database cell, so we save it as JSON
+        # text (the same trick as questions.options). json.loads turns it
+        # back into a list when we search.
+        conn.execute(
+            "INSERT INTO chunks (material_id, chunk_index, text, embedding) VALUES (?, ?, ?, ?)",
+            (material_id, index, chunk, json.dumps(embedding))
+        )
+        # 1c. Choose which chunks Gemini will see, instead of sending everything.
+    if request.topic:
+        # Topic given: retrieve the chunks closest in meaning to it.
+        # search_chunks returns (score, chunk_id, text) tuples, best first.
+        # (It sees the chunks we just saved because it shares the same
+        # `conn`, even though we haven't committed yet.)
+        results = search_chunks(request.topic, material_id, top_k=4)
+        selected_texts = [text for score, chunk_id, text in results]
+    else:
+        # No topic: spread evenly across the whole material.
+        # spread_chunks returns (chunk_id, text) tuples, a different shape.
+        results = spread_chunks(material_id, k=4)
+        selected_texts = [text for chunk_id, text in results]
+
+    # Glue the chosen chunks into one block of context for the prompt.
+    context = "\n\n".join(selected_texts)
+
+
+        # Tell Gemini what to focus on, but only if the student gave a topic.
+    # (Same "value if condition else other" pattern as the options guard.)
+    focus = f"All questions must be about this topic: {request.topic}\n\n" if request.topic else ""
 
     # 2. Ask Gemini for questions (schema-constrained structured output)
     response = client.models.generate_content(
         model="gemini-3.5-flash-lite",
-        contents=f"Generate {request.num_questions} quiz questions based on the following course material:\n\n{request.course_text}",
+        contents=f"{focus}Generate {request.num_questions} quiz questions based on the following course material:\n\n{context}",
         config={
             "response_mime_type": "application/json",
             "response_schema": list[Question],

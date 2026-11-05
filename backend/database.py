@@ -32,14 +32,31 @@ CREATE TABLE IF NOT EXISTS materials (
 """)
 
 
+# chunks: one row per piece of a material, cut by chunking.py.
+# embedding holds the chunk's meaning as a list of numbers, stored as
+# JSON text (json.dumps going in, json.loads coming out), the same trick
+# as questions.options. It's nullable because a chunk is saved first and
+# its embedding is added right after.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY,
+    material_id INTEGER NOT NULL REFERENCES materials(id),
+    chunk_index INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    embedding TEXT
+)
+""")
+
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY,
-    material_id INTEGER NOT NULL REFERENCES materials(id), 
+    material_id INTEGER NOT NULL REFERENCES materials(id),
     question_text TEXT NOT NULL,
     question_type TEXT NOT NULL,
     options TEXT,
-    correct_answer TEXT NOT NULL)
+    correct_answer TEXT NOT NULL
+)
 """)
 
 
@@ -53,5 +70,6 @@ CREATE TABLE IF NOT EXISTS attempts (
     attempted_at TEXT NOT NULL
 )
 """)
+
 
 conn.commit()
