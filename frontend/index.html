@@ -95,6 +95,10 @@
     <textarea id="course-text" placeholder="Paste your notes, textbook excerpt, or study guide here..."></textarea>
     <label for="num-questions">Number of questions</label>
     <input type="number" id="num-questions" value="3" min="1" max="10">
+    <!-- NEW: the topic is the "query" for retrieval. Leave it empty and the
+         server picks chunks spread evenly across the whole material. -->
+    <label for="topic">Topic to practice (optional)</label>
+    <input type="text" id="topic" placeholder="e.g. chain rule">
     <button id="generate-btn" onclick="generateQuestions()">Generate Questions</button>
     <div id="generate-loading" class="loading hidden">Generating questions...</div>
   </div>
@@ -108,12 +112,16 @@
 
 <script>
   const API_BASE = "http://127.0.0.1:8000";
-  // Each question here is {id, question_text, question_type, options} — no correct_answer.
+  // Each question here is {id, question_text, question_type, options}.
+  // There is no correct_answer: the server keeps the answer key.
   let currentQuestions = [];
 
   async function generateQuestions() {
     const courseText = document.getElementById("course-text").value.trim();
     const numQuestions = parseInt(document.getElementById("num-questions").value);
+    // NEW: read the topic box. An empty box becomes null below, which the
+    // server treats as "no topic".
+    const topic = document.getElementById("topic").value.trim();
 
     if (!courseText) {
       alert("Please paste some course material first.");
@@ -127,7 +135,8 @@
       const res = await fetch(`${API_BASE}/generate-questions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ course_text: courseText, num_questions: numQuestions })
+        // NEW: topic is sent along with the text and the question count.
+        body: JSON.stringify({ course_text: courseText, num_questions: numQuestions, topic: topic || null })
       });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       currentQuestions = await res.json();
@@ -237,6 +246,7 @@
       document.getElementById("results-screen").classList.add("hidden");
       document.getElementById("input-screen").classList.remove("hidden");
       document.getElementById("course-text").value = "";
+      document.getElementById("topic").value = "";
     };
     container.appendChild(restartBtn);
   }
