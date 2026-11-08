@@ -54,6 +54,10 @@ class Question(BaseModel):
     question_type: Literal["multiple_choice", "short_answer"]
     options: Optional[list[str]] = None
     correct_answer: str
+    # NEW: which chunks this question was written from. We ask Gemini to
+    # fill this in, using the [Chunk N] labels we'll add to the prompt.
+    # A question can draw on several chunks, so it's a LIST of ids.
+    source_chunk_ids: list[int]
 
 
 # The browser-safe question: a ticket (id) and NO correct_answer.
@@ -115,23 +119,24 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
             "INSERT INTO chunks (material_id, chunk_index, text, embedding) VALUES (?, ?, ?, ?)",
             (material_id, index, chunk, json.dumps(embedding))
         )
-        # 1c. Choose which chunks Gemini will see, instead of sending everything.
+        # 1c. Choose which chunks Gemini will see, as (chunk_id, text) pairs.
+    # The two search functions return different shapes, so we convert both
+    # to the same shape here and the rest of the code doesn't care which ran.
     if request.topic:
-        # Topic given: retrieve the chunks closest in meaning to it.
-        # search_chunks returns (score, chunk_id, text) tuples, best first.
-        # (It sees the chunks we just saved because it shares the same
-        # `conn`, even though we haven't committed yet.)
+        # search_chunks returns (score, chunk_id, text), best first.
         results = search_chunks(request.topic, material_id, top_k=4)
-        selected_texts = [text for score, chunk_id, text in results]
+        selected = [(chunk_id, text) for score, chunk_id, text in results]
     else:
-        # No topic: spread evenly across the whole material.
-        # spread_chunks returns (chunk_id, text) tuples, a different shape.
-        results = spread_chunks(material_id, k=4)
-        selected_texts = [text for chunk_id, text in results]
+        # spread_chunks already returns (chunk_id, text) pairs.
+        selected = spread_chunks(material_id, k=4)
 
-    # Glue the chosen chunks into one block of context for the prompt.
-    context = "\n\n".join(selected_texts)
-
+    # Label each chunk with its id, like "[Chunk 8]", so Gemini has
+    # something to point back at when it names its sources.
+    context = "\n\n".join(f"[Chunk {chunk_id}]\n{text}" for chunk_id, text in selected)
+    # The set of chunk ids we actually showed Gemini. Used below to reject
+    # any id it cites that wasn't in the prompt. Schema-constrained output
+    # guarantees these are integers, not that they're TRUE.
+    valid_chunk_ids = {chunk_id for chunk_id, text in selected}
 
         # Tell Gemini what to focus on, but only if the student gave a topic.
     # (Same "value if condition else other" pattern as the options guard.)
@@ -140,7 +145,7 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
     # 2. Ask Gemini for questions (schema-constrained structured output)
     response = client.models.generate_content(
         model="gemini-3.5-flash-lite",
-        contents=f"{focus}Generate {request.num_questions} quiz questions based on the following course material:\n\n{context}",
+                contents=f"{focus}Generate {request.num_questions} quiz questions based on the following course material. For each question, set source_chunk_ids to the numbers of the [Chunk N] sections you used.\n\n{context}",
         config={
             "response_mime_type": "application/json",
             "response_schema": list[Question],
@@ -159,6 +164,14 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
             (material_id, q.question_text, q.question_type, options_text, q.correct_answer)
         )
         question_id = cursor.lastrowid
+        # Save one row per source chunk Gemini cited for this question,
+        # skipping any id that wasn't in the prompt (the check above).
+        for chunk_id in q.source_chunk_ids:
+            if chunk_id in valid_chunk_ids:
+                conn.execute(
+                    "INSERT INTO question_chunks (question_id, chunk_id) VALUES (?, ?)",
+                    (question_id, chunk_id)
+                )
         questions_out.append(QuestionOut(
             id=question_id,
             question_text=q.question_text,

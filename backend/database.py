@@ -60,6 +60,20 @@ CREATE TABLE IF NOT EXISTS questions (
 """)
 
 
+# question_chunks: which chunks each question was written from.
+# A question can draw on several chunks and a chunk can inspire several
+# questions (many-to-many), so each row is ONE pairing, like the
+# question_concepts idea from earlier. Phase 4 uses this to check a
+# question against its source.
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS question_chunks (
+    question_id INTEGER NOT NULL REFERENCES questions(id),
+    chunk_id INTEGER NOT NULL REFERENCES chunks(id)
+)
+""")
+
+
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS attempts (
     id INTEGER PRIMARY KEY,
