@@ -35,8 +35,7 @@ CREATE TABLE IF NOT EXISTS materials (
 # chunks: one row per piece of a material, cut by chunking.py.
 # embedding holds the chunk's meaning as a list of numbers, stored as
 # JSON text (json.dumps going in, json.loads coming out), the same trick
-# as questions.options. It's nullable because a chunk is saved first and
-# its embedding is added right after.
+# as questions.options.
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY,
@@ -48,6 +47,12 @@ CREATE TABLE IF NOT EXISTS chunks (
 """)
 
 
+# questions: validation_status records whether the question passed our
+# checks ('approved', 'flagged', or 'unchecked' for questions saved
+# before validation existed). Defaulting to 'unchecked' is the honest
+# choice: we never claim a question passed a check it didn't go through.
+# validation_reason says why a flagged question was rejected, which
+# Phase 7 will use to measure how well the judge works.
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS questions (
     id INTEGER PRIMARY KEY,
@@ -55,23 +60,22 @@ CREATE TABLE IF NOT EXISTS questions (
     question_text TEXT NOT NULL,
     question_type TEXT NOT NULL,
     options TEXT,
-    correct_answer TEXT NOT NULL
+    correct_answer TEXT NOT NULL,
+    validation_status TEXT NOT NULL DEFAULT 'unchecked',
+    validation_reason TEXT
 )
 """)
 
 
 # question_chunks: which chunks each question was written from.
-# A question can draw on several chunks and a chunk can inspire several
-# questions (many-to-many), so each row is ONE pairing, like the
-# question_concepts idea from earlier. Phase 4 uses this to check a
-# question against its source.
+# Many-to-many (a question can draw on several chunks, and a chunk can
+# inspire several questions), so each row is ONE pairing.
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS question_chunks (
     question_id INTEGER NOT NULL REFERENCES questions(id),
     chunk_id INTEGER NOT NULL REFERENCES chunks(id)
 )
 """)
-
 
 
 cursor.execute("""

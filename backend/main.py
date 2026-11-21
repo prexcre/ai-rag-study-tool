@@ -11,6 +11,7 @@ from datetime import datetime
 from chunking import chunk_text
 from embeddings import embed_text
 from search import search_chunks, spread_chunks
+from validation import check_basic_rules, judge_support
 
 
 load_dotenv()
@@ -154,30 +155,60 @@ async def generate_questions(request: GenerateQuestionsRequest) -> list[Question
     questions_data = json.loads(response.text)
     questions = [Question(**q) for q in questions_data]  # defense in depth: re-validate
 
-    # 3. Save each question (with its correct_answer) in the back room,
-    #    and build the browser-safe version (ticket, no coat)
+    # 3. Validate each question, save it WITH its verdict, and send the
+    #    browser only the approved ones (ticket, no coat).
+
+    # {chunk_id: text} for the chunks Gemini actually saw, so the judge can
+    # read the passage each question cites without another database query.
+    chunk_text_by_id = dict(selected)
+
     questions_out = []
     for q in questions:
+        # Only chunk ids that were really in the prompt count as sources.
+        cited_ids = [cid for cid in q.source_chunk_ids if cid in valid_chunk_ids]
+
+        # Layer 1: plain-code rules. Free and reliable, so they run first.
+        problems = check_basic_rules(q)
+        if not cited_ids:
+            problems.append("cites no valid source chunk")
+
+        if problems:
+            status, reason = "flagged", "; ".join(problems)
+        else:
+            # Layer 2: the Gemini judge. Only questions that passed layer 1
+            # reach it, which saves calls.
+            try:
+                verdict = judge_support(q, [chunk_text_by_id[cid] for cid in cited_ids])
+                status = "approved" if verdict.supported else "flagged"
+                reason = verdict.reason
+            except Exception as e:
+                # The judge call itself failed (like the 503 you hit).
+                # We couldn't check this question, so we must not claim
+                # anything about it. Which honest status goes here?
+                status, reason = "unchecked", f"judge call failed: {e}"
+
         options_text = json.dumps(q.options) if q.options is not None else None
         cursor = conn.execute(
-            "INSERT INTO questions (material_id, question_text, question_type, options, correct_answer) VALUES (?, ?, ?, ?, ?)",
-            (material_id, q.question_text, q.question_type, options_text, q.correct_answer)
+            "INSERT INTO questions (material_id, question_text, question_type, options, correct_answer, validation_status, validation_reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (material_id, q.question_text, q.question_type, options_text, q.correct_answer, status, reason)
         )
         question_id = cursor.lastrowid
-        # Save one row per source chunk Gemini cited for this question,
-        # skipping any id that wasn't in the prompt (the check above).
-        for chunk_id in q.source_chunk_ids:
-            if chunk_id in valid_chunk_ids:
-                conn.execute(
-                    "INSERT INTO question_chunks (question_id, chunk_id) VALUES (?, ?)",
-                    (question_id, chunk_id)
-                )
-        questions_out.append(QuestionOut(
-            id=question_id,
-            question_text=q.question_text,
-            question_type=q.question_type,
-            options=q.options,
-        ))
+
+        # Save the source links for every question, flagged or not.
+        for chunk_id in cited_ids:
+            conn.execute(
+                "INSERT INTO question_chunks (question_id, chunk_id) VALUES (?, ?)",
+                (question_id, chunk_id)
+            )
+
+        # Only approved questions go to the browser.
+        if status == "approved":
+            questions_out.append(QuestionOut(
+                id=question_id,
+                question_text=q.question_text,
+                question_type=q.question_type,
+                options=q.options,
+            ))
 
     # 4. Make everything permanent, then return only the safe version
     conn.commit()
