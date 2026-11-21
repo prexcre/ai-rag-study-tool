@@ -384,7 +384,86 @@ Four steps: embed the topic, load the saved chunk embeddings, score each by cosi
 - ✅ Chunking, embedding at upload, cosine-similarity search, topic-driven retrieval, source tracking in `question_chunks`
 - ⏭️ Next: Phase 4, question validation (is each question supported by its source chunk?)
 
-## Phase 4 — Question Validation (upcoming)
+## Phase 4 — Question Validation
+
+### 1. The problem: structure is not truth
+
+Schema-constrained output (Phase 1) guarantees a question's **shape**: right fields, right types, right allowed values. It does not guarantee the question is **true**, supported by the notes, or even answerable. Gemini can write a question its source doesn't support, give a wrong answer key, or cite the wrong chunk. Phase 4 builds the checks that close that gap before a student ever sees a question.
+
+### 2. Two layers, cheapest first (`validation.py`)
+
+- **Layer 1: plain-code rules.** Free, instant, perfectly reliable. Same principle as grading multiple choice with `==` instead of an LLM: don't use a model where plain code works.
+- **Layer 2: an LLM judge.** For what code can't check: whether a passage *means* what the question claims. Layer 1 runs first, and only questions that pass it reach the judge, which saves paid calls.
+
+### 3. Layer 1: rule checks
+
+- **`correct_answer not in options`** (for multiple choice). The grader compares with `==`, so the answer key must match one option *exactly*, or no student can ever be marked right. Example of the failure: key `"B) Zero"` vs. option `"Zero"`.
+- **"Cites no valid source chunk"**: a question whose cited ids weren't actually in the prompt gets flagged.
+- **Gotcha: `not in` vs `is not`.** `in` / `not in` test membership ("is this item in that list?"). `is not` tests object identity, and a string is never the same object as a list, so `is not` would flag *every* question. The self-test (one good case, one bad case) exposed this immediately, which is what self-tests are for.
+- Rules take any object with the right attributes (no import of the `Question` class), which avoids a circular import with `main.py`.
+
+### 4. Why a database check can't verify a source
+
+First idea: compare the question's saved chunk to the chunk it cites. That can't work, because the link *came from Gemini*. Comparing Gemini's claim to Gemini's claim always matches. A question about the quotient rule citing the chain rule chunk would pass.
+
+To find out whether a link is *true*, put two things side by side: the **question plus its answer key** and the **chunk text**. The answer key must be included, because a question can be on-topic with a wrong answer, and the answer key is what students get graded against.
+
+### 5. Layer 2: the judge
+
+- **Schema:** `SupportVerdict {supported: bool, reason: str}`, the same small-schema pattern as `GradeResult`, with local re-validation (defense in depth).
+- **Key prompt instruction: use ONLY the passage.** A question can be true in the real world and still unsupported by *the student's notes*, which counts as not supported. A study tool should only quiz on what the source says.
+- **Tested on three cases against one passage:**
+  1. Supported question → `True`.
+  2. Question about something the passage never mentions (quotient rule) → `False`. The judge's *reason* talked about what the passage contains, not about the real-world formula, evidence that the "use only the passage" instruction works.
+  3. On-topic question with a wrong answer key (`^5` vs. the passage's `^4`) → `False`. The judge read the key, not just the topic.
+- **Caveat:** three cases is a tiny sample, and the judge is a model, so it can be wrong. Phase 7 measures how often, using questions where we already know which are bad.
+
+### 6. What to do with a rejected question
+
+Options: drop it, save it but flag it and never show it, or show it with a warning. We chose **save and flag, never show.** Showing a question you've flagged as unsupported defeats the point of checking.
+
+Why keep it rather than drop it: Phase 7 needs the flagged ones to measure how often the judge flags questions and whether it was right; and the saved reason could later be fed back into a retry prompt ("this wasn't supported because..., write a better one"). **Correction to a natural assumption:** Gemini doesn't remember anything between calls, so a saved bad question doesn't teach it; the *retry prompt* is what would use it.
+
+### 7. Status design: honesty over convenience
+
+`questions` gained two columns:
+- `validation_status`: `approved` | `flagged` | `unchecked`
+- `validation_reason`: why a question was flagged (or the judge's explanation)
+
+**`unchecked` is the default**, for old questions and for any question the judge couldn't evaluate. A status must never claim a check that didn't happen: `approved` would say it passed, `flagged` would say it failed, and neither is true for a question that was never checked. Same schema-change habit as Phase 3: `ALTER TABLE` on the live database, plus the updated `CREATE TABLE` in `database.py`.
+
+### 8. Wiring it into `/generate-questions`
+
+For each generated question: filter cited ids to those actually shown (`valid_chunk_ids`), run layer 1, then (if it passed) layer 2, save the question **with** its verdict and source links, and return only `approved` questions to the browser. The judge call sits in a `try/except`, and a crash marks the question `unchecked` instead of failing the whole request.
+
+### 9. Failures are real: 5xx errors and retries
+
+A genuine `503 UNAVAILABLE` ("high demand") hit during testing. It left question 34 `unchecked`, never shown, and the page correctly displayed 2 questions instead of 3. The design absorbed a real failure.
+
+- **4xx = our request was bad; 5xx = their server had a problem.**
+- **Retry only 5xx** (`errors.ServerError`): the same request can succeed a moment later. **Never retry 4xx** (`ClientError`): resending the identical broken request fails identically.
+- **Cap the retries, and wait longer between them** (2s, then 4s). On the last attempt, `raise` so the caller's `except` marks the question `unchecked`.
+- **Honest limit:** the Gemini library already retries internally before raising, so extra retries on our side may help less than hoped, and we haven't yet *seen* ours trigger. Watch real runs before trusting it.
+
+### 10. Consequences and known gaps
+
+- **Fewer questions than requested.** Flagged and unchecked ones are saved but hidden, so asking for 3 can return 2. Planned fix: **retry-to-fill**, asking Gemini for replacements (using the judge's reason).
+- **If the judge is down, the student sees an empty quiz.** Safe (nothing unverified gets through) but poor UX. Needs a friendly message on the page.
+- **Generation is slow and sequential:** one embedding call per chunk plus one judge call per question, one after another. Running them concurrently is a later optimization.
+- **The check is only as good as the judge.** Measuring that is Phase 7.
+
+### 11. Gotchas hit
+
+- **A query on the database shows only what was saved.** An empty result for "my new question" meant the page had never been opened (generation never ran), not a bug. Check the newest `id` to tell whether anything was saved at all.
+- **Exact names matter:** `SupportVerdict` (not `Supported Verdict`), `ServerError` (not `5xx` or `ClientError`).
+- **`git add .` only covers the current folder and below.** Run it from the repo root.
+
+### Status at end of Phase 4
+
+- ✅ Rule checks and the LLM judge, each tested on deliberately bad questions
+- ✅ Verdicts and reasons saved on every question; only `approved` questions reach the browser
+- ✅ Judge failures handled honestly (`unchecked`) and 5xx errors retried with a cap
+- ⏭️ Next: retry-to-fill, then Phase 5 (concepts and per-concept mastery)
 
 ## Phase 5 — Concept Mastery (upcoming)
 *(build `concepts` and `question_concepts` junction table here)*
