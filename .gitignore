@@ -13,3 +13,5 @@ node_modules/
 .vscode/
 study.db
 
+
+.DS_Store

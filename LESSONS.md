@@ -272,8 +272,117 @@ Instead of rewriting `/evaluate-answers` in place, we added `EvaluateAnswersRequ
 
 ---
 
-## Phase 3 — Source-Grounded Generation / RAG (upcoming)
-*(chunking, embeddings, vector similarity, retrieval — to be filled in)*
+## Phase 3 — Source-Grounded Generation / RAG
+
+### 1. Why RAG at all
+
+**Problem:** Phase 1/2 pasted the *entire* course text into one prompt. For a real textbook that means high cost, slow responses, a model with no clear target, and eventually text that won't fit in the context window at all.
+
+**Idea:** retrieval-augmented generation = **find** the few relevant passages first, then **generate** from only those. Open-book exam logic: you don't re-read 300 pages, you flip to the right chapter.
+
+**Important correction:** the LLM never searches anything. Ordinary software finds the passages, and the LLM just receives them in its prompt. RAG is two jobs: a search system, plus the same generation call we already had.
+
+**Side benefits:** every question can be traced to the passage it came from (Phase 4 uses this), and "practice my weak topics" later becomes "retrieve passages about those topics."
+
+### 2. Chunking: cutting text so search works
+
+**Why not cut every N characters:** arbitrary cuts split sentences ("It takes place in the chloroplasts..." with no antecedent) and mix topics in one chunk, giving a blurry search target.
+
+**Rules we built (`chunking.py`):**
+1. **Cut at natural seams:** paragraph breaks (`"\n\n"`).
+2. **Maximum:** a paragraph over the limit is split at *sentence ends*, re-packing whole sentences up to the limit (never cutting mid-sentence). A sentence longer than the max stays whole rather than being cut.
+3. **Minimum:** pieces under the limit are merged with their neighbors so each chunk can stand alone.
+4. **Order matters:** split first, then merge, and merge must also respect the max.
+5. **Max beats min:** a chunk may end up under the minimum (e.g. the last leftover) because an oversized chunk is worse than a small one.
+
+**Too big** = no clear target. **Too small** = not enough meaning to write a question from or to match in search. Real defaults: min 300, max 1000 characters. Tests use tiny limits (like 40 and 80) so the behavior is predictable by hand; test numbers are passed in and never leave the test block.
+
+**Known imperfection:** `re.split` on `". "` mis-splits "Dr. Smith" or "1. Mix." That's acceptable because we re-pack sentences instead of cutting at every split point, so a false split is only a place we *could* cut.
+
+**Later refinement:** overlap between chunks, so ideas straddling a boundary appear whole in at least one.
+
+### 3. Embeddings: meaning as numbers
+
+**Keyword search fails** when a chunk says "drugs that stop a protein from working" but the query is "enzyme inhibition" (no shared words), and it can also match chunks that mention a word in passing.
+
+**Embedding:** a fixed-length list of numbers (3,072 for `gemini-embedding-2`) produced by a dedicated embedding model. Similar meanings get similar numbers. Picture a map of meaning where each text is a pin; real maps have thousands of coordinates.
+
+**Key points:**
+- **Fixed size, whatever the input.** One word or a full chunk both return exactly 3,072 numbers. It's a fixed-size *summary*, not a copy. The size was chosen by the model's designers, a tradeoff between detail and storage/speed.
+- **Same model for chunks and queries, always.** Different models have different maps, so their numbers can't be compared. Changing the model means re-embedding everything, which is why the model name lives in one constant (`EMBEDDING_MODEL`).
+- **When to compute:** chunks **once**, at upload (their text never changes); the topic **every time** (it's new text each request).
+- **Gotcha:** `.values` is the attribute that pulls the numbers out of the result (`result.embeddings[0].values`), not `.vector`.
+
+### 4. Storing embeddings
+
+The `chunks` table got an `embedding TEXT` column holding the JSON text of the 3,072 numbers (`json.dumps` in, `json.loads` out), the same trick as `questions.options`. Each embedding is about 42,000 characters of text, heavy but fine at this scale. A dedicated vector database is the real-world answer when it grows (a Phase 3 decision deferred until measurements justify it).
+
+**Schema habit:** when you change a live table with `ALTER TABLE`, also update the `CREATE TABLE` in `database.py` so a fresh database matches. A *duplicate* `CREATE TABLE IF NOT EXISTS` block is a trap: the first one wins and the second is silently skipped.
+
+### 5. Cosine similarity: "how close in meaning"
+
+Compares **direction**, not distance. Treat each embedding as an arrow:
+- **1** = same direction (same meaning)
+- **0** = right angle (unrelated)
+- **-1** = opposite
+
+Real text rarely goes near -1. What matters is the **ranking** and the **gaps** between scores, not the absolute number: in our test, 0.83 vs 0.738 was a real signal, while 0.738 vs 0.722 was noise.
+
+### 6. Search (`search.py`)
+
+Four steps: embed the topic, load the saved chunk embeddings, score each by cosine similarity, keep the top few.
+
+**Bug-in-waiting:** `scored.sort(reverse=True)`. Python sorts smallest first by default; `reverse=True` puts the *highest* scores first. With `False`, the search runs perfectly and returns the three *worst* matches. Always sanity-check results against your own sense of what's right.
+
+**Paraphrase test:** for "unwrapping layered expressions from the outside in" (no shared words with the chain rule paragraph), the right chunk still ranked first, at 0.612 vs 0.83 for the direct query. Meaning carried most of the weight, though wording still mattered somewhat.
+
+**Test-design lesson:** my first "no shared words" query actually shared several words, so it proved nothing. A test has to isolate the thing you're testing. Write a falsifiable prediction *before* running, then compare. That's the seed of Phase 7 evaluation.
+
+### 7. Wiring retrieval into generation
+
+- **New request field:** `topic: Optional[str] = None`, plus a topic box on the page.
+- **Topic given:** `search_chunks(topic, material_id, top_k=4)`.
+- **No topic:** `spread_chunks(material_id, k=4)` picks chunks evenly across the material (`rows[i * len(rows) // k]`, multiply first then divide so remainders spread out instead of being dropped). This keeps the prompt small for any material length and keeps chunking useful, instead of falling back to "send everything." Known limit: it takes the first chunk of each segment, so the very last chunk can be skipped.
+- **Both search functions return different tuple shapes**, so we convert them to a common `(chunk_id, text)` shape right after choosing.
+- **Prompt matters too:** retrieval decides what Gemini *sees*; the prompt must say what to *focus on*. With only retrieval, a 5-chunk material and `top_k=4` meant Gemini saw almost everything and wrote off-topic questions. Adding `focus = "All questions must be about this topic: ..."` fixed it. Retrieval narrows context; the prompt sets focus.
+- Retrieval only filters meaningfully when there are many more chunks than `top_k`; with 5 chunks it barely does.
+
+### 8. Source tracking: `question_chunks`
+
+**Problem:** Phase 4 needs to know which chunks each question came from, but Gemini receives a mixed block of text and returns no sources.
+
+**Design:** a question can draw on several chunks and a chunk can inspire several questions, so it's many-to-many: a pairs table, `question_chunks(question_id, chunk_id)`, the same junction pattern as `question_concepts`.
+
+**How we get the data:**
+1. Label each chunk in the prompt: `[Chunk 8]`.
+2. Add `source_chunk_ids: list[int]` to the `Question` schema and ask Gemini to fill it with the chunk numbers it used.
+3. **Validate:** keep only ids that were actually in the prompt (`valid_chunk_ids`). Schema-constrained output guarantees *integers*, not that they're *true*. Same structure-vs-correctness split as Phase 1.
+
+**Result:** all three chain-rule questions linked to the chain rule chunk, readable with a `JOIN`. **Limit:** the check is shallow. It confirms the cited id was shown, not that the question truly came from it. Verifying that is Phase 4.
+
+### 9. Project structure (one file per job)
+
+`database.py` (tables and connection), `chunking.py` (cut text), `embeddings.py` (text to numbers), `search.py` (find closest chunks), `main.py` (routes that wire them together). Self-test blocks under `if __name__ == "__main__":` run only when the file is run directly, never when imported.
+
+### 10. Gotchas hit
+
+- **Exact names:** `source_chunks_id` vs `source_chunk_ids` gives an `AttributeError`; Python needs a character-for-character match. Copy names from where they're defined.
+- **Count your input:** six paragraphs with one merge gives five chunks, not four. Count before predicting.
+- **`git add .` only covers the current folder and below.** From `backend/`, it can't reach `../frontend/index.html`. Run it from the repo root and read `git status`.
+- **The same notes + same topic gave the same questions.** Search has no randomness and the model is mostly consistent on identical prompts, so that's expected, not a bug.
+
+### 11. Planned improvements and known gaps
+
+- **Hybrid search + reranking:** run keyword matching alongside semantic search (keyword is strongest on exact terms like "Km" or formulas, where embeddings can be fuzzy), merge the ranked lists, and optionally rerank the top results. Plan: measure plain semantic retrieval first in Phase 7, then add these only where measurements show they help, so each addition has evidence behind it.
+- **Duplicate questions:** nothing prevents repeats yet (a query over `questions` and `attempts`, coming later).
+- **Duplicate materials:** every generate click re-saves identical notes as a new material with new paid embedding calls. Later cleanup: reuse a material when the text is identical.
+- **Chunk overlap** and a smarter last-chunk merge.
+- **Phase 4:** verify that each question is actually supported by its cited chunk.
+
+### Status at end of Phase 3
+
+- ✅ Chunking, embedding at upload, cosine-similarity search, topic-driven retrieval, source tracking in `question_chunks`
+- ⏭️ Next: Phase 4, question validation (is each question supported by its source chunk?)
 
 ## Phase 4 — Question Validation (upcoming)
 
