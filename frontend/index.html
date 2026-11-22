@@ -115,6 +115,7 @@
   // Each question here is {id, question_text, question_type, options}.
   // There is no correct_answer: the server keeps the answer key.
   let currentQuestions = [];
+  let requestedCount = 0;  // how many questions the student asked for
 
   async function generateQuestions() {
     const courseText = document.getElementById("course-text").value.trim();
@@ -140,6 +141,7 @@
       });
       if (!res.ok) throw new Error(`Server returned ${res.status}`);
       currentQuestions = await res.json();
+      requestedCount = numQuestions;
       renderQuestions();
     } catch (err) {
       alert("Failed to generate questions: " + err.message + "\n\nIs your backend running on " + API_BASE + "?");
@@ -156,6 +158,34 @@
     const container = document.getElementById("questions-screen");
     container.innerHTML = "";
     container.classList.remove("hidden");
+
+    // Nothing passed validation: say so instead of showing an empty quiz.
+    if (currentQuestions.length === 0) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.innerHTML = `
+        <div class="question-text">No questions this time</div>
+        <div class="feedback">None of the generated questions passed our accuracy checks. Try again, or use a more specific topic.</div>
+      `;
+      const backBtn = document.createElement("button");
+      backBtn.textContent = "Back";
+      backBtn.style.marginTop = "12px";
+      backBtn.onclick = () => {
+        container.classList.add("hidden");
+        document.getElementById("input-screen").classList.remove("hidden");
+      };
+      card.appendChild(backBtn);
+      container.appendChild(card);
+      return;
+    }
+
+    // Fewer than requested: be upfront about it.
+    if (currentQuestions.length < requestedCount) {
+      const note = document.createElement("div");
+      note.className = "subtitle";
+      note.textContent = `Showing ${currentQuestions.length} of ${requestedCount} questions. The rest didn't pass our accuracy checks.`;
+      container.appendChild(note);
+    }
 
     currentQuestions.forEach((q, i) => {
       const block = document.createElement("div");
